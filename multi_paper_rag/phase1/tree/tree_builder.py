@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import re
+from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -75,7 +76,7 @@ def build_tree(
         toc_entries = get_toc(pdf_path)
         if toc_entries and len(toc_entries) >= 3:
             logger.info("TOC found with %d entries — using TOC-based path", len(toc_entries))
-            sections = _build_from_toc(toc_entries, pages, total_pages)
+            sections = _build_from_toc(toc_entries, pages, total_pages, full_text)
             build_method = "toc_based"
     except Exception as exc:
         logger.warning("TOC extraction failed: %s", exc)
@@ -98,11 +99,13 @@ def build_tree(
         build_method = "fallback_chunked"
 
     # ── Assemble PaperTree ─────────────────────────────────────────────
+    extracted_meta = _extract_metadata_from_text(full_text, pdf_path)
+    
     tree = PaperTree(
         paper_id=paper_id,
-        title=metadata.get("title", _extract_title_from_text(full_text)),
-        arxiv_id=metadata.get("arxiv_id"),
-        authors=metadata.get("authors", []),
+        title=metadata.get("title") or extracted_meta["title"],
+        arxiv_id=metadata.get("arxiv_id") or extracted_meta["arxiv_id"],
+        authors=metadata.get("authors") if metadata.get("authors") else extracted_meta["authors"],
         file_path=pdf_path,
         file_hash=file_hash,
         total_pages=total_pages,
@@ -130,44 +133,79 @@ def _build_from_toc(
     toc_entries: list,
     pages: List[Dict],
     total_pages: int,
+    full_text: str,
 ) -> List[SectionNode]:
     """
-    Map PyMuPDF TOC entries to SectionNode objects.
-
-    Args:
-        toc_entries: List of [level, title, page_number] from doc.get_toc().
-        pages:       Per-page extracted text dicts.
-        total_pages: Total page count.
-
-    Returns:
-        List of top-level SectionNode objects with nested children.
+    Map PyMuPDF TOC entries to SectionNode objects using character-level slicing.
     """
-    # Build flat section list with page ranges
     flat_sections: List[Dict[str, Any]] = []
-    for idx, (level, title, page_num) in enumerate(toc_entries):
-        page_start = max(1, page_num)
-        # page_end = next entry's page - 1, or total_pages
-        if idx + 1 < len(toc_entries):
-            page_end = max(page_start, toc_entries[idx + 1][2] - 1)
-            # If next section starts on the same page, share it
-            if page_end < page_start:
-                page_end = page_start
+    
+    # 1. Map TOC to text positions
+    positions = []
+    search_offset = 0
+    for level, title, page_num in toc_entries:
+        title = title.strip()
+        # Restrict search around the expected page to avoid matching wrong occurrences
+        expected_page_start = max(1, page_num)
+        
+        pos = _find_heading_position(full_text, title, start_offset=search_offset)
+        if pos == -1:
+            # Fallback: maybe title has slight numbering differences, let's try removing leading numbers
+            clean_title = re.sub(r"^[\d\.\s]+", "", title)
+            if clean_title:
+                pos = _find_heading_position(full_text, clean_title, start_offset=search_offset)
+                
+        if pos != -1:
+            positions.append({"level": level, "title": title, "pos": pos, "page_start": expected_page_start})
+            search_offset = pos  # next heading must be after this one
         else:
-            page_end = total_pages
+            # If still not found, we just estimate based on page
+            logger.warning("Could not find TOC heading '%s' in text", title)
+            # Find character offset for the start of the expected page
+            page_char_offset = 0
+            cumulative = 0
+            for p in pages:
+                if p["page_number"] == expected_page_start:
+                    page_char_offset = cumulative
+                    break
+                cumulative += len(p["text"]) + 1
+            positions.append({"level": level, "title": title, "pos": max(search_offset, page_char_offset), "page_start": expected_page_start})
 
-        content = _extract_content_for_pages(pages, page_start, page_end)
+    # 1.5 Append standard tail sections if TOC missed them
+    tail_sections = ["Limitations", "Acknowledgments", "References", "Appendix"]
+    for tail in tail_sections:
+        # Check if already in positions
+        if any(tail.lower() in p["title"].lower() for p in positions):
+            continue
+        
+        pos = _find_heading_position(full_text, tail, start_offset=search_offset)
+        if pos != -1:
+            # Found a missing tail section!
+            expected_page = _find_page_for_position(pages, full_text, pos)
+            positions.append({"level": 1, "title": tail, "pos": pos, "page_start": expected_page})
+            search_offset = pos
 
-        flat_sections.append(
-            {
-                "title": title.strip(),
-                "level": level,
-                "page_start": page_start,
-                "page_end": page_end,
-                "content": content,
-            }
-        )
+    # 2. Slice content
+    for i, sec in enumerate(positions):
+        start_pos = sec["pos"]
+        # Determine next position
+        next_pos = len(full_text)
+        for j in range(i + 1, len(positions)):
+            if positions[j]["pos"] > start_pos:
+                next_pos = positions[j]["pos"]
+                break
+                
+        content = full_text[start_pos:next_pos].strip()
+        page_end = _find_page_for_position(pages, full_text, max(start_pos, next_pos - 1))
+        
+        flat_sections.append({
+            "title": sec["title"],
+            "level": sec["level"],
+            "page_start": sec["page_start"],
+            "page_end": max(sec["page_start"], page_end),
+            "content": content,
+        })
 
-    # Assign section IDs and nest
     _assign_section_ids(flat_sections)
     return _nest_sections(flat_sections)
 
@@ -178,6 +216,7 @@ def _build_from_toc(
 
 _LLM_SYSTEM_PROMPT = """You are a document structure analyser.
 Read the following academic paper text and identify ALL section headings in the exact order they appear.
+Do not miss any sections. Pay special attention to sections at the end like "Limitations", "Acknowledgments", and "References".
 For each section return:
   - The exact heading text as it appears
   - Whether it is a top-level section (level 1) or subsection (level 2 or 3)
@@ -230,6 +269,9 @@ def _build_from_llm(
 
     # For each identified section, locate in full_text and extract content
     flat_sections: List[Dict[str, Any]] = []
+    search_offset = 0
+    positions = []
+    
     for idx, sec in enumerate(llm_sections):
         title = sec.get("title", "").strip()
         level = int(sec.get("level", 1))
@@ -237,31 +279,37 @@ def _build_from_llm(
             continue
 
         # Find position in full text
-        position = _find_heading_position(full_text, title)
+        position = _find_heading_position(full_text, title, start_offset=search_offset)
+        if position == -1:
+            clean_title = re.sub(r"^[\d\.\s]+", "", title)
+            if clean_title:
+                position = _find_heading_position(full_text, clean_title, start_offset=search_offset)
+                
         if position == -1:
             logger.debug("Could not locate heading '%s' in text — skipping", title)
             continue
+            
+        positions.append({"level": level, "title": title, "pos": position})
+        search_offset = position
 
-        # Determine content boundaries
-        next_position = len(full_text)
-        for next_sec in llm_sections[idx + 1 :]:
-            next_title = next_sec.get("title", "").strip()
-            if next_title:
-                np = _find_heading_position(full_text, next_title)
-                if np > position:
-                    next_position = np
-                    break
+    for i, sec in enumerate(positions):
+        start_pos = sec["pos"]
+        next_pos = len(full_text)
+        for j in range(i + 1, len(positions)):
+            if positions[j]["pos"] > start_pos:
+                next_pos = positions[j]["pos"]
+                break
 
-        content = full_text[position:next_position].strip()
+        content = full_text[start_pos:next_pos].strip()
 
         # Map to page numbers
-        page_start = _find_page_for_position(pages, full_text, position)
-        page_end = _find_page_for_position(pages, full_text, min(next_position - 1, len(full_text) - 1))
+        page_start = _find_page_for_position(pages, full_text, start_pos)
+        page_end = _find_page_for_position(pages, full_text, min(next_pos - 1, len(full_text) - 1))
 
         flat_sections.append(
             {
-                "title": title,
-                "level": level,
+                "title": sec["title"],
+                "level": sec["level"],
                 "page_start": max(1, page_start),
                 "page_end": max(1, page_end),
                 "content": content,
@@ -367,32 +415,35 @@ def _extract_content_for_pages(
     return "\n".join(texts).strip()
 
 
-def _find_heading_position(full_text: str, heading: str) -> int:
+def _find_heading_position(full_text: str, heading: str, start_offset: int = 0) -> int:
     """
     Find the position of a heading in the full text using flexible matching.
 
     Args:
         full_text: Complete document text.
         heading:   Section heading to search for.
+        start_offset: Search only after this character offset.
 
     Returns:
         Character offset of the heading, or -1 if not found.
     """
+    search_text = full_text[start_offset:]
+    
     # Try exact match first
-    pos = full_text.find(heading)
+    pos = search_text.find(heading)
     if pos != -1:
-        return pos
+        return pos + start_offset
 
     # Try case-insensitive
-    pos = full_text.lower().find(heading.lower())
+    pos = search_text.lower().find(heading.lower())
     if pos != -1:
-        return pos
+        return pos + start_offset
 
     # Try with collapsed whitespace
     collapsed_heading = re.sub(r"\s+", r"\\s+", re.escape(heading))
-    match = re.search(collapsed_heading, full_text, re.IGNORECASE)
+    match = re.search(collapsed_heading, search_text, re.IGNORECASE)
     if match:
-        return match.start()
+        return match.start() + start_offset
 
     return -1
 
@@ -424,10 +475,8 @@ def _find_page_for_position(
 def _assign_section_ids(flat_sections: List[Dict]) -> None:
     """
     Assign hierarchical section IDs (e.g. "1", "1.1", "2") in-place.
-
-    Args:
-        flat_sections: List of dicts with 'level' key. Modified in-place
-                       to add 'section_id'.
+    Prefers numbering found in the title (e.g. "4 Conclusion" -> "4").
+    If no numbering is found, uses a slug of the title or generated counter.
     """
     counters = [0] * 10  # Support up to 10 levels deep
     for sec in flat_sections:
@@ -436,8 +485,18 @@ def _assign_section_ids(flat_sections: List[Dict]) -> None:
         # Reset all deeper counters
         for deeper in range(level + 1, len(counters)):
             counters[deeper] = 0
-        # Build ID from counters
-        sec["section_id"] = ".".join(str(counters[lv]) for lv in range(1, level + 1))
+            
+        title = sec["title"].strip()
+        # Look for explicit numbering like "1", "1.1", "4.", "IV." 
+        # But for now let's just handle decimal numbers "1.2"
+        match = re.match(r"^([\d\.]+)\s+", title)
+        if match:
+            extracted_id = match.group(1).rstrip('.')
+            sec["section_id"] = extracted_id
+        else:
+            # For unnumbered sections like "Acknowledgments", use a slug instead of sequential number
+            slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+            sec["section_id"] = slug if slug else ".".join(str(counters[lv]) for lv in range(1, level + 1))
 
 
 def _nest_sections(flat_sections: List[Dict]) -> List[SectionNode]:
@@ -486,23 +545,62 @@ def _nest_sections(flat_sections: List[Dict]) -> List[SectionNode]:
     return root_nodes
 
 
-def _extract_title_from_text(full_text: str) -> str:
+def _extract_metadata_from_text(full_text: str, file_path: str) -> Dict[str, Any]:
     """
-    Best-effort title extraction from the first few lines of text.
+    Best-effort metadata extraction from the first few lines of text.
 
     Args:
         full_text: Full document text.
+        file_path: Fallback filename for title.
 
     Returns:
-        Extracted title string or "Untitled Paper".
+        Dict with 'title', 'authors', and 'arxiv_id'.
     """
+    meta = {
+        "title": Path(file_path).name,
+        "authors": [],
+        "arxiv_id": None
+    }
+    
     lines = full_text[:2000].split("\n")
-    for line in lines:
-        stripped = line.strip()
-        # Skip very short or empty lines
-        if len(stripped) > 10 and not stripped.startswith("arXiv"):
-            return stripped[:200]
-    return "Untitled Paper"
+    cleaned_lines = [l.strip() for l in lines if l.strip()]
+    
+    # Extract arXiv ID
+    arxiv_match = re.search(r"arxiv:\s*(\d{4}\.\d{4,5}(?:v\d+)?)", full_text[:3000], re.IGNORECASE)
+    if arxiv_match:
+        meta["arxiv_id"] = arxiv_match.group(1)
+        
+    # Title is usually the first non-trivial line
+    for line in cleaned_lines:
+        if len(line) > 10 and not line.lower().startswith("arxiv") and not line.lower().startswith("abstract"):
+            meta["title"] = line[:200]
+            break
+            
+    # Try to extract authors (heuristics: lines after title, before abstract, often separated by commas or containing known names)
+    authors_text = []
+    found_title = False
+    for line in cleaned_lines[:20]:
+        if meta["title"] in line:
+            found_title = True
+            continue
+        if found_title:
+            if line.lower().startswith("abstract"):
+                break
+            # A simple heuristic: if a line has commas and words, it might be authors or affiliations
+            if len(line) > 5 and len(line.split()) < 20:
+                # remove email addresses
+                line = re.sub(r"\S+@\S+", "", line).strip()
+                if line:
+                    authors_text.append(line)
+                    
+    if authors_text:
+        # Join and split by common separators
+        joined = " ".join(authors_text)
+        # Split by comma or 'and'
+        parts = re.split(r",|\band\b", joined)
+        meta["authors"] = [p.strip() for p in parts if p.strip() and len(p.strip().split()) <= 4]
+
+    return meta
 
 
 def _parse_json_response(text: str) -> Optional[Dict]:

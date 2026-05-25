@@ -55,7 +55,8 @@ def extract_text_from_pdf(pdf_path: str) -> Dict[str, Any]:
     for page_num in range(total_pages):
         try:
             page = doc[page_num]
-            text = page.get_text("text") or ""
+            raw_text = page.get_text("text") or ""
+            text = _clean_page_text(raw_text)
             pages.append({"page_number": page_num + 1, "text": text})
         except Exception as exc:
             logger.warning(
@@ -152,3 +153,35 @@ def _fail(
         "full_text": full_text,
         "error": error,
     }
+
+
+import re
+
+def _clean_page_text(text: str) -> str:
+    """Remove common headers, footers, and OCR noise from page text."""
+    lines = text.split("\n")
+    cleaned_lines = []
+    for line in lines:
+        sline = line.strip()
+        if not sline:
+            continue
+        # Remove copyright/ACM/WWW footers
+        if "Permission to make digital or hard copies" in sline:
+            continue
+        if sline.startswith("WWW Companion") or "Copyright held by" in sline:
+            continue
+        if re.match(r"^arxiv:\d{4}\.\d{4,5}(v\d+)?", sline, re.IGNORECASE):
+            continue
+        # Skip lines that are just numbers (like page numbers or lonely chart axis values)
+        if re.match(r"^\d+$", sline):
+            continue
+        # Skip garbled math or mojibake (high density of non-ascii or single weird chars)
+        if len(sline) > 0 and len([c for c in sline if ord(c) > 127]) / len(sline) > 0.5:
+            continue
+        # Skip isolated letters often found in graphs (e.g., 'a', 'b') if not part of a sentence
+        if len(sline) == 1 and sline.lower() in "abcdefghijklmnopqrstuvwxyz":
+            continue
+        
+        cleaned_lines.append(sline)
+    return "\n".join(cleaned_lines)
+
