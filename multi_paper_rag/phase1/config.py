@@ -33,7 +33,7 @@ logger = logging.getLogger("phase1")
 # ---------------------------------------------------------------------------
 NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
-NVIDIA_MODEL: str = "dracarys-llama-3.1-70b-instruct"
+NVIDIA_MODEL: str = "meta/llama-3.1-70b-instruct"
 
 # ---------------------------------------------------------------------------
 # Groq  (used for fast querying)

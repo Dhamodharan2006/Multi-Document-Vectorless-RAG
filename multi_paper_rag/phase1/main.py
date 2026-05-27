@@ -215,7 +215,7 @@ def _print_section_tree(sections, indent: int = 0) -> None:
         prefix = " " * indent
         words = sec.word_count
         pages = f"pp. {sec.page_start}-{sec.page_end}"
-        print(f"{prefix}├─ [{sec.section_id}] {sec.title}  ({pages}, {words} words)")
+        print(f"{prefix}|- [{sec.section_id}] {sec.title}  ({pages}, {words} words)")
         if sec.children:
             _print_section_tree(sec.children, indent + 4)
 

@@ -16,3 +16,10 @@ wheels/
 # Data storage (exclude PDFs and JSON tree data)
 multi_paper_rag/phase1/data/pdfs/*.pdf
 multi_paper_rag/phase1/data/trees/*.json
+
+# Scratch files
+scratch_test.py
+scratch_tree.py
+scratch_tree_analyzer.py
+scratch_tree_output.txt
+

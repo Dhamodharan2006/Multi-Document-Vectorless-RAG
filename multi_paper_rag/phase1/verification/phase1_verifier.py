@@ -151,15 +151,11 @@ def _test_3_tree_accuracy(tree):
     if len(top_level) < 4:
         checks.append(f"only {len(top_level)} top-level sections (need ≥4)")
 
-    # "Abstract" or "Introduction" should appear
-    titles_lower = [s.title.lower() for s in all_sections]
-    has_expected = any(
-        keyword in t
-        for t in titles_lower
-        for keyword in ["abstract", "introduction"]
-    )
+    # "abstract" or "introduction" section_type should exist
+    section_types = [s.section_type for s in all_sections]
+    has_expected = any(t in section_types for t in ["abstract", "introduction"])
     if not has_expected:
-        checks.append("neither 'Abstract' nor 'Introduction' found in titles")
+        checks.append("neither 'abstract' nor 'introduction' found in section_types")
 
     # All fields non-null
     for sec in all_sections:
