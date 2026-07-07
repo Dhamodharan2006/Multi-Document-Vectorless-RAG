@@ -1,4 +1,4 @@
-# 📘 Multi-Paper Vectorless RAG — Full Project Deep Dive
+# 📘 PaperCompass — Navigate research papers by their own structure, not vector guesswork
 
 ---
 
